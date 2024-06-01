@@ -41,6 +41,7 @@ pub struct QuinnQuicEndpointConfig {
     pub certificate_file: Option<PathBuf>,
     pub private_key_file: Option<PathBuf>,
     pub keep_alive_interval: u64,
+    pub initial_window: u64,
     pub transport_config: QuinnQuicTransportConfig,
 }
 
@@ -260,6 +261,12 @@ fn configure_client(ep_config: &QuinnQuicEndpointConfig) -> Result<ClientConfig,
         transport_config.max_concurrent_uni_streams(1u32.into());
         transport_config.mtu_discovery_config(Some(mtu_config));
 
+        if ep_config.initial_window > 0 {
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(ep_config.initial_window);
+            transport_config.congestion_controller_factory(Arc::new(bbr));
+        }
+
         transport_config
     };
 
@@ -385,6 +392,12 @@ fn configure_server(
         transport_config.max_concurrent_bidi_streams(0u32.into());
         transport_config.max_concurrent_uni_streams(1u32.into());
         transport_config.mtu_discovery_config(Some(mtu_config));
+
+        if ep_config.initial_window > 0 {
+            let mut bbr = quinn::congestion::BbrConfig::default();
+            bbr.initial_window(ep_config.initial_window);
+            transport_config.congestion_controller_factory(Arc::new(bbr));
+        }
 
         transport_config
     };

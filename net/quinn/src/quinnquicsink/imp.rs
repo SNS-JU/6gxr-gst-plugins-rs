@@ -54,6 +54,7 @@ struct Settings {
     role: QuinnQuicRole,
     timeout: u32,
     keep_alive_interval: u64,
+    initial_window: u64,
     secure_conn: bool,
     use_datagram: bool,
     certificate_file: Option<PathBuf>,
@@ -74,6 +75,7 @@ impl Default for Settings {
             role: DEFAULT_ROLE,
             timeout: DEFAULT_TIMEOUT,
             keep_alive_interval: 0,
+            initial_window: 0,
             secure_conn: DEFAULT_SECURE_CONNECTION,
             use_datagram: false,
             certificate_file: None,
@@ -214,6 +216,12 @@ impl ObjectImpl for QuinnQuicSink {
 		    .default_value(0)
                     .readwrite()
                     .build(),
+		glib::ParamSpecUInt64::builder("initial-window")
+                    .nick("Initial congestion window in bytes")
+                    .blurb("Initial cwnd of the underlying BBR algorithm. Value set in bytes, 0 uses the default (200 * 1200)")
+		    .default_value(0)
+                    .readwrite()
+                    .build(),
                 glib::ParamSpecBoolean::builder("secure-connection")
                     .nick("Use secure connection")
                     .blurb("Use certificates for QUIC connection. False: Insecure connection, True: Secure connection.")
@@ -323,6 +331,9 @@ impl ObjectImpl for QuinnQuicSink {
             "keep-alive-interval" => {
                 settings.keep_alive_interval = value.get().expect("type checked upstream");
             }
+            "initial-window" => {
+                settings.initial_window = value.get().expect("type checked upstream");
+            }
             "secure-connection" => {
                 settings.secure_conn = value.get().expect("type checked upstream");
             }
@@ -392,6 +403,7 @@ impl ObjectImpl for QuinnQuicSink {
             "role" => settings.role.to_value(),
             "timeout" => settings.timeout.to_value(),
             "keep-alive-interval" => settings.keep_alive_interval.to_value(),
+            "initial-window" => settings.initial_window.to_value(),
             "secure-connection" => settings.secure_conn.to_value(),
             "certificate-file" => {
                 let certfile = settings.certificate_file.as_ref();
@@ -666,6 +678,7 @@ impl QuinnQuicSink {
             let role = settings.role;
             let use_datagram = settings.use_datagram;
             let keep_alive_interval = settings.keep_alive_interval;
+            let initial_window = settings.initial_window;
             let secure_conn = settings.secure_conn;
             let certificate_file = settings.certificate_file.clone();
             let private_key_file = settings.private_key_file.clone();
@@ -683,6 +696,7 @@ impl QuinnQuicSink {
                     certificate_file,
                     private_key_file,
                     keep_alive_interval,
+                    initial_window,
                     transport_config,
                 },
             )

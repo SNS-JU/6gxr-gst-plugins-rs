@@ -57,6 +57,7 @@ struct Settings {
     role: QuinnQuicRole,
     timeout: u32,
     keep_alive_interval: u64,
+    initial_window: u64,
     next_addr: String,
     migration_trigger_size: u64,
     secure_conn: bool,
@@ -79,6 +80,7 @@ impl Default for Settings {
             role: DEFAULT_ROLE,
             timeout: DEFAULT_TIMEOUT,
             keep_alive_interval: 0,
+            initial_window: 0,
             next_addr: "".to_string(),
             migration_trigger_size: 0,
             secure_conn: DEFAULT_SECURE_CONNECTION,
@@ -226,6 +228,12 @@ impl ObjectImpl for QuinnQuicSrc {
 		    .default_value(0)
                     .readwrite()
                     .build(),
+		glib::ParamSpecUInt64::builder("initial-window")
+                    .nick("Initial congestion window in bytes")
+                    .blurb("Initial cwnd of the underlying BBR algorithm. Value set in bytes, 0 uses the default (200 * 1200)")
+		    .default_value(0)
+                    .readwrite()
+                    .build(),
 		glib::ParamSpecString::builder("next-address-port")
                     .nick("next QUIC client address")
                     .blurb("Address to be used by this QUIC client after client migration")
@@ -353,6 +361,9 @@ impl ObjectImpl for QuinnQuicSrc {
             "keep-alive-interval" => {
                 settings.keep_alive_interval = value.get().expect("type checked upstream");
             }
+            "initial-window" => {
+                settings.initial_window = value.get().expect("type checked upstream");
+            }
             "next-address-port" => {
                 settings.next_addr = value.get::<String>().expect("type checked upstream");
             }
@@ -426,6 +437,7 @@ impl ObjectImpl for QuinnQuicSrc {
             "caps" => settings.caps.to_value(),
             "timeout" => settings.timeout.to_value(),
             "keep-alive-interval" => settings.keep_alive_interval.to_value(),
+            "initial-window" => settings.initial_window.to_value(),
             "next-address-port" => settings.next_addr.to_value(),
             "migration-trigger-size" => settings.migration_trigger_size.to_value(),
             "secure-connection" => settings.secure_conn.to_value(),
@@ -784,6 +796,7 @@ impl QuinnQuicSrc {
             let role = settings.role;
             let use_datagram = settings.use_datagram;
             let keep_alive_interval = settings.keep_alive_interval;
+            let initial_window = settings.initial_window;
             let secure_conn = settings.secure_conn;
             let certificate_file = settings.certificate_file.clone();
             let private_key_file = settings.private_key_file.clone();
@@ -801,6 +814,7 @@ impl QuinnQuicSrc {
                     certificate_file,
                     private_key_file,
                     keep_alive_interval,
+                    initial_window,
                     transport_config,
                 },
             )
