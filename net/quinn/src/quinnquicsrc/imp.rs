@@ -22,7 +22,9 @@ use once_cell::sync::Lazy;
 use quinn::{Connection, ConnectionError, Endpoint, ReadError, RecvStream, TransportConfig};
 use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+mod dbus_control;
 
 const DEFAULT_ROLE: QuinnQuicRole = QuinnQuicRole::Server;
 
@@ -96,7 +98,7 @@ impl Default for Settings {
 }
 
 pub struct QuinnQuicSrc {
-    settings: Mutex<Settings>,
+    settings: Arc<Mutex<Settings>>,
     state: Mutex<State>,
     canceller: Mutex<utils::Canceller>,
     bytes_total: Mutex<u64>,
@@ -106,7 +108,7 @@ pub struct QuinnQuicSrc {
 impl Default for QuinnQuicSrc {
     fn default() -> Self {
         Self {
-            settings: Mutex::new(Settings::default()),
+            settings: Arc::new(Mutex::new(Settings::default())),
             state: Mutex::new(State::default()),
             canceller: Mutex::new(utils::Canceller::default()),
             bytes_total: Mutex::new(0),
@@ -889,6 +891,8 @@ impl QuinnQuicSrc {
                 },
             )
         };
+
+        tokio::task::spawn(dbus_control::init(self.settings.clone()));
 
         let endpoint = match role {
             QuinnQuicRole::Server => server_endpoint(&endpoint_config).map_err(|err| {
