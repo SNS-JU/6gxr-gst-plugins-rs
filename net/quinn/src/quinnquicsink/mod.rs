@@ -23,6 +23,8 @@
 use gst::glib;
 use gst::prelude::*;
 
+use tracing_subscriber::prelude::*;
+
 pub mod imp;
 
 glib::wrapper! {
@@ -30,6 +32,21 @@ glib::wrapper! {
 }
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
+    tracing_log::LogTracer::init().expect("Failed to set logger");
+    let env_filter = tracing_subscriber::EnvFilter::try_from_env("QUINNQUICSINK_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_thread_ids(true)
+        .with_target(true)
+        .with_span_events(
+            tracing_subscriber::fmt::format::FmtSpan::NEW
+                | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        );
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(env_filter)
+        .with(fmt_layer);
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+
     gst::Element::register(
         Some(plugin),
         "quinnquicsink",

@@ -24,6 +24,9 @@ rustls-pki-types = "1"
 rcgen = "0.13"
 bytes = "1.5.0"
 thiserror = "1"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
+tracing-log = "0.2"
 
 [dev-dependencies]
 gst-check = { workspace = true, features = ["v1_20"] }
