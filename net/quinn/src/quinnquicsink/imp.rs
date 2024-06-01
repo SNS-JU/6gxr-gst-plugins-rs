@@ -18,6 +18,7 @@ use gst::{glib, prelude::*, subclass::prelude::*};
 use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
 use quinn::{Connection, SendStream, TransportConfig};
+use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -55,6 +56,7 @@ struct Settings {
     timeout: u32,
     keep_alive_interval: u64,
     initial_window: u64,
+    segment_datagrams: bool,
     secure_conn: bool,
     use_datagram: bool,
     certificate_file: Option<PathBuf>,
@@ -76,6 +78,7 @@ impl Default for Settings {
             timeout: DEFAULT_TIMEOUT,
             keep_alive_interval: 0,
             initial_window: 0,
+            segment_datagrams: DEFAULT_SEGMENT_DATAGRAMS,
             secure_conn: DEFAULT_SECURE_CONNECTION,
             use_datagram: false,
             certificate_file: None,
@@ -90,6 +93,7 @@ pub struct QuinnQuicSink {
     settings: Mutex<Settings>,
     state: Mutex<State>,
     canceller: Mutex<utils::Canceller>,
+    datagram_idx: Mutex<Wrapping<u8>>,
 }
 
 impl Default for QuinnQuicSink {
@@ -98,6 +102,7 @@ impl Default for QuinnQuicSink {
             settings: Mutex::new(Settings::default()),
             state: Mutex::new(State::default()),
             canceller: Mutex::new(utils::Canceller::default()),
+            datagram_idx: Mutex::new(Wrapping(0u8)),
         }
     }
 }
@@ -222,6 +227,12 @@ impl ObjectImpl for QuinnQuicSink {
 		    .default_value(0)
                     .readwrite()
                     .build(),
+		glib::ParamSpecBoolean::builder("segment-datagrams")
+                    .nick("Segment large buffers into smaller datagrams")
+                    .blurb("If false, consider setting drop-buffer-for-datagram")
+		    .default_value(DEFAULT_SEGMENT_DATAGRAMS)
+                    .readwrite()
+                    .build(),
                 glib::ParamSpecBoolean::builder("secure-connection")
                     .nick("Use secure connection")
                     .blurb("Use certificates for QUIC connection. False: Insecure connection, True: Secure connection.")
@@ -334,6 +345,9 @@ impl ObjectImpl for QuinnQuicSink {
             "initial-window" => {
                 settings.initial_window = value.get().expect("type checked upstream");
             }
+            "segment-datagrams" => {
+                settings.segment_datagrams = value.get().expect("type checked upstream");
+            }
             "secure-connection" => {
                 settings.secure_conn = value.get().expect("type checked upstream");
             }
@@ -404,6 +418,7 @@ impl ObjectImpl for QuinnQuicSink {
             "timeout" => settings.timeout.to_value(),
             "keep-alive-interval" => settings.keep_alive_interval.to_value(),
             "initial-window" => settings.initial_window.to_value(),
+            "segment-datagrams" => settings.segment_datagrams.to_value(),
             "secure-connection" => settings.secure_conn.to_value(),
             "certificate-file" => {
                 let certfile = settings.certificate_file.as_ref();
@@ -593,6 +608,7 @@ impl QuinnQuicSink {
         let timeout = settings.timeout;
         let use_datagram = settings.use_datagram;
         let drop_buffer_for_datagram = settings.drop_buffer_for_datagram;
+        let segment_datagrams = settings.segment_datagrams;
         drop(settings);
 
         let mut state = self.state.lock().unwrap();
@@ -611,33 +627,75 @@ impl QuinnQuicSink {
         };
 
         if use_datagram {
-            match conn.max_datagram_size() {
-                Some(size) => {
-                    if src.len() > size {
-                        if drop_buffer_for_datagram {
-                            gst::warning!(CAT, imp: self, "Buffer dropped, current max datagram size: {size} > buffer size: {}", src.len());
-                            return Ok(());
-                        } else {
-                            return Err(Some(gst::error_msg!(
-                                        gst::ResourceError::Failed,
-                                        ["Sending data failed, current max datagram size: {size}, buffer size: {}", src.len()]
-                            )));
+            if ! segment_datagrams {
+                match conn.max_datagram_size() {
+                    Some(size) => {
+                        if src.len() > size {
+                            if drop_buffer_for_datagram {
+                                gst::warning!(CAT, imp: self, "Buffer dropped, current max datagram size: {size} > buffer size: {}", src.len());
+                                return Ok(());
+                            } else {
+                                return Err(Some(gst::error_msg!(
+                                    gst::ResourceError::Failed,
+                                    ["Sending data failed, current max datagram size: {size}, buffer size: {}", src.len()]
+                                )));
+                            }
+                        }
+
+                        match conn.send_datagram(Bytes::copy_from_slice(src)) {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(Some(gst::error_msg!(
+                                gst::ResourceError::Failed,
+                                ["Sending data failed: {}", e]
+                            ))),
                         }
                     }
-
-                    match conn.send_datagram(Bytes::copy_from_slice(src)) {
+                    /*
+                     * We check for datagram being unsupported by peer in
+                     * start/init_connection, so we should never reach here.
+                     */
+                    None => unreachable!(),
+                }
+            } else {
+                // Segment datagrams
+                let mut start: usize = 0;
+                let end = src.len();
+                let mut ret = Ok(());
+                let pkt_idx = {
+                    let i = &mut *self.datagram_idx.lock().unwrap();
+                    *i = *i + Wrapping(1u8);
+                    (*i).0
+                };
+                let mut chunk_idx: u8 = 1;
+                while start < end || ret.is_err() {
+                    let free_len = conn.max_datagram_size().unwrap_or(2) - 2;
+                    let dlen = std::cmp::min(free_len, end - start);
+                    let mut data = if start + dlen < end {
+                        vec![chunk_idx, pkt_idx]
+                    } else {
+                        // this is the last segment
+                        vec![(chunk_idx + 128) as u8, pkt_idx]
+                    };
+                    data.extend_from_slice(&src[start..start + dlen]);
+                    chunk_idx = (chunk_idx + 1) % 128; // TODO: handle wrapping
+                    start += dlen;
+                    // println!(
+                    //     "c:{:2x} p:{:2x} last:{:5} len:{:4} free-len:{}",
+                    //     data[0] % 128,
+                    //     data[1],
+                    //     data[0] & 128 == 128,
+                    //     data.len(),
+                    //     free_len,
+                    // );
+                    ret = match conn.send_datagram(Bytes::copy_from_slice(&data)) {
                         Ok(_) => Ok(()),
                         Err(e) => Err(Some(gst::error_msg!(
                             gst::ResourceError::Failed,
                             ["Sending data failed: {}", e]
                         ))),
-                    }
+                    };
                 }
-                /*
-                 * We check for datagram being unsupported by peer in
-                 * start/init_connection, so we should never reach here.
-                 */
-                None => unreachable!(),
+                ret
             }
         } else {
             let send = &mut stream.as_mut().unwrap();

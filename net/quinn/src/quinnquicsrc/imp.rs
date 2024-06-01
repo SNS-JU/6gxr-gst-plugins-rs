@@ -58,6 +58,7 @@ struct Settings {
     timeout: u32,
     keep_alive_interval: u64,
     initial_window: u64,
+    segment_datagrams: bool,
     next_addr: String,
     migration_trigger_size: u64,
     secure_conn: bool,
@@ -81,6 +82,7 @@ impl Default for Settings {
             timeout: DEFAULT_TIMEOUT,
             keep_alive_interval: 0,
             initial_window: 0,
+            segment_datagrams: DEFAULT_SEGMENT_DATAGRAMS,
             next_addr: "".to_string(),
             migration_trigger_size: 0,
             secure_conn: DEFAULT_SECURE_CONNECTION,
@@ -234,6 +236,12 @@ impl ObjectImpl for QuinnQuicSrc {
 		    .default_value(0)
                     .readwrite()
                     .build(),
+		glib::ParamSpecBoolean::builder("segment-datagrams")
+                    .nick("Segment large buffers into smaller datagrams")
+                    .blurb("If false, consider setting drop-buffer-for-datagram")
+		    .default_value(DEFAULT_SEGMENT_DATAGRAMS)
+                    .readwrite()
+                    .build(),
 		glib::ParamSpecString::builder("next-address-port")
                     .nick("next QUIC client address")
                     .blurb("Address to be used by this QUIC client after client migration")
@@ -364,6 +372,9 @@ impl ObjectImpl for QuinnQuicSrc {
             "initial-window" => {
                 settings.initial_window = value.get().expect("type checked upstream");
             }
+            "segment-datagrams" => {
+                settings.segment_datagrams = value.get().expect("type checked upstream");
+            }
             "next-address-port" => {
                 settings.next_addr = value.get::<String>().expect("type checked upstream");
             }
@@ -438,6 +449,7 @@ impl ObjectImpl for QuinnQuicSrc {
             "timeout" => settings.timeout.to_value(),
             "keep-alive-interval" => settings.keep_alive_interval.to_value(),
             "initial-window" => settings.initial_window.to_value(),
+            "segment-datagrams" => settings.segment_datagrams.to_value(),
             "next-address-port" => settings.next_addr.to_value(),
             "migration-trigger-size" => settings.migration_trigger_size.to_value(),
             "secure-connection" => settings.secure_conn.to_value(),
@@ -634,6 +646,7 @@ impl QuinnQuicSrc {
         let settings = self.settings.lock().unwrap();
         let timeout = settings.timeout;
         let use_datagram = settings.use_datagram;
+        let segment_datagrams = settings.segment_datagrams;
         drop(settings);
 
         let mut state = self.state.lock().unwrap();
@@ -653,24 +666,81 @@ impl QuinnQuicSrc {
 
         let future = async {
             if use_datagram {
-                match conn.read_datagram().await {
-                    Ok(bytes) => Ok(bytes),
-                    Err(err) => match err {
-                        ConnectionError::ApplicationClosed(ac) => {
-                            gst::info!(CAT, imp: self, "Application closed connection, {}", ac);
-                            Ok(Bytes::new())
-                        }
-                        ConnectionError::ConnectionClosed(cc) => {
-                            gst::info!(CAT, imp: self, "Transport closed connection, {}", cc);
-                            Ok(Bytes::new())
-                        }
-                        _ => Err(WaitError::FutureError(gst::error_msg!(
-                            gst::ResourceError::Failed,
-                            ["Datagram read error: {}", err]
-                        ))),
-                    },
+                if ! segment_datagrams {
+                    match conn.read_datagram().await {
+                        Ok(bytes) => Ok(bytes),
+                        Err(err) => match err {
+                            ConnectionError::ApplicationClosed(ac) => {
+                                gst::info!(CAT, imp: self, "Application closed connection, {}", ac);
+                                Ok(Bytes::new())
+                            }
+                            ConnectionError::ConnectionClosed(cc) => {
+                                gst::info!(CAT, imp: self, "Transport closed connection, {}", cc);
+                                Ok(Bytes::new())
+                            }
+                            _ => Err(WaitError::FutureError(gst::error_msg!(
+                                gst::ResourceError::Failed,
+                                ["Datagram read error: {}", err]
+                            ))),
+                        },
+                    }
+                } else {
+                    // Segment datagrams.
+
+                    //println!("Before loop");
+                    let mut buffer = Vec::<u8>::new();
+                    let mut expected_chunk_idx: u8 = 1;
+                    let mut expected_pkt_idx: u8 = 0;
+                    loop {
+                        match conn.read_datagram().await {
+                            Ok(bytes) => {
+                                let chunk_idx = bytes[0] % 128;
+                                let last_chunk = (bytes[0] & 128) == 128;
+                                let pkt_idx = bytes[1];
+                                // println!(
+                                //     "last:{:5} cidx:{:2x} pkt_idx:{:2x} len:{:4}, e-cidx:{:2x} e-eidx:{:2x}",
+                                //     last_chunk,
+                                //     chunk_idx,
+                                //     pkt_idx,
+                                //     bytes.len(),
+                                //     expected_chunk_idx,
+                                //     expected_pkt_idx
+                                // );
+                                if pkt_idx != expected_pkt_idx || chunk_idx != expected_chunk_idx {
+                                    expected_chunk_idx = 1;
+                                    expected_pkt_idx = pkt_idx;
+                                    buffer.truncate(0);
+                                }
+                                if chunk_idx == 1 {
+                                    expected_chunk_idx = 1;
+                                    expected_pkt_idx = pkt_idx;
+                                    buffer.truncate(0);
+                                }
+                                if expected_chunk_idx == chunk_idx && expected_pkt_idx == pkt_idx {
+                                    expected_chunk_idx += 1;
+                                    buffer.extend_from_slice(&bytes[2..]);
+                                }
+                                if last_chunk {
+                                    return Ok(Bytes::copy_from_slice(&buffer));
+                                }
+                            }
+                            Err(err) => match err {
+                                ConnectionError::ApplicationClosed(_)
+                                    | ConnectionError::ConnectionClosed(_) => {
+                                        return Ok(Bytes::new());
+                                    }
+                                _ => {
+                                    return Err(WaitError::FutureError(gst::error_msg!(
+                                        gst::ResourceError::Failed,
+                                        ["Datagram read error: {}", err]
+                                    )));
+                                }
+                            },
+                        };
+                    }
                 }
             } else {
+                // Stream mode
                 let recv = stream.as_mut().unwrap();
 
                 match recv.read_chunk(length as usize, true).await {
