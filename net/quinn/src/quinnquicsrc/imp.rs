@@ -19,7 +19,8 @@ use gst_base::prelude::*;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 use once_cell::sync::Lazy;
-use quinn::{Connection, ConnectionError, ReadError, RecvStream, TransportConfig};
+use quinn::{Connection, ConnectionError, Endpoint, ReadError, RecvStream, TransportConfig};
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -56,6 +57,8 @@ struct Settings {
     role: QuinnQuicRole,
     timeout: u32,
     keep_alive_interval: u64,
+    next_addr: String,
+    migration_trigger_size: u64,
     secure_conn: bool,
     caps: gst::Caps,
     use_datagram: bool,
@@ -76,6 +79,8 @@ impl Default for Settings {
             role: DEFAULT_ROLE,
             timeout: DEFAULT_TIMEOUT,
             keep_alive_interval: 0,
+            next_addr: "".to_string(),
+            migration_trigger_size: 0,
             secure_conn: DEFAULT_SECURE_CONNECTION,
             caps: gst::Caps::new_any(),
             use_datagram: false,
@@ -90,6 +95,8 @@ pub struct QuinnQuicSrc {
     settings: Mutex<Settings>,
     state: Mutex<State>,
     canceller: Mutex<utils::Canceller>,
+    bytes_total: Mutex<u64>,
+    endpoint: Mutex<Option<Endpoint>>,
 }
 
 impl Default for QuinnQuicSrc {
@@ -98,6 +105,8 @@ impl Default for QuinnQuicSrc {
             settings: Mutex::new(Settings::default()),
             state: Mutex::new(State::default()),
             canceller: Mutex::new(utils::Canceller::default()),
+            bytes_total: Mutex::new(0),
+            endpoint: Mutex::new(None),
         }
     }
 }
@@ -214,6 +223,16 @@ impl ObjectImpl for QuinnQuicSrc {
 		glib::ParamSpecUInt64::builder("keep-alive-interval")
                     .nick("QUIC connection keep alive interval in ms")
                     .blurb("Keeps QUIC connection alive by periodically pinging the server. Value set in ms, 0 disables this feature")
+		    .default_value(0)
+                    .readwrite()
+                    .build(),
+		glib::ParamSpecString::builder("next-address-port")
+                    .nick("next QUIC client address")
+                    .blurb("Address to be used by this QUIC client after client migration")
+                    .build(),
+		glib::ParamSpecUInt64::builder("migration-trigger-size")
+                    .nick("trigger QUIC client migration after receiving bytes of data")
+                    .blurb("Migrate QUIC client connection after bytes of data received. 0 disables migration")
 		    .default_value(0)
                     .readwrite()
                     .build(),
@@ -334,6 +353,12 @@ impl ObjectImpl for QuinnQuicSrc {
             "keep-alive-interval" => {
                 settings.keep_alive_interval = value.get().expect("type checked upstream");
             }
+            "next-address-port" => {
+                settings.next_addr = value.get::<String>().expect("type checked upstream");
+            }
+            "migration-trigger-size" => {
+                settings.migration_trigger_size = value.get().expect("type checked upstream");
+            }
             "secure-connection" => {
                 settings.secure_conn = value.get().expect("type checked upstream");
             }
@@ -401,6 +426,8 @@ impl ObjectImpl for QuinnQuicSrc {
             "caps" => settings.caps.to_value(),
             "timeout" => settings.timeout.to_value(),
             "keep-alive-interval" => settings.keep_alive_interval.to_value(),
+            "next-address-port" => settings.next_addr.to_value(),
+            "migration-trigger-size" => settings.migration_trigger_size.to_value(),
             "secure-connection" => settings.secure_conn.to_value(),
             "certificate-file" => {
                 let certfile = settings.certificate_file.as_ref();
@@ -666,7 +693,35 @@ impl QuinnQuicSrc {
         };
 
         match wait(&self.canceller, future, timeout) {
-            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Ok(bytes)) => {
+                let migration_trigger_size = {
+                    let settings = self.settings.lock().unwrap();
+                    settings.migration_trigger_size
+                };
+
+                if migration_trigger_size > 0 {
+                    let mut bytes_total = self.bytes_total.lock().unwrap();
+                    *bytes_total += bytes.len() as u64;
+
+                    if *bytes_total >= migration_trigger_size {
+                        let addr_str = {
+                            let settings = self.settings.lock().unwrap();
+                            String::from(&settings.next_addr)
+                        };
+                        if addr_str.is_empty() {
+                            panic!("cannot parse next client address");
+                        }
+                        // do the migration
+                        wait(&self.canceller, self.migrate(addr_str), timeout)
+                            .expect("migration failed");
+
+                        // clear next client addr
+                        let mut settings = self.settings.lock().unwrap();
+                        settings.migration_trigger_size = 0;
+                    }
+                }
+                Ok(bytes)
+            }
             Ok(Err(e)) | Err(e) => match e {
                 WaitError::FutureAborted => {
                     gst::warning!(CAT, imp: self, "Read from stream request aborted");
@@ -677,6 +732,39 @@ impl QuinnQuicSrc {
                     Err(Some(e))
                 }
             },
+        }
+    }
+
+    async fn migrate(&self, addr_str: String) {
+        let addr = make_socket_addr(addr_str.as_str());
+        match addr {
+            Ok(address) => {
+                let mut settings = self.settings.lock().unwrap();
+                let addr = format!("{}:{}", settings.address, settings.port);
+                let address_string = address.to_string();
+                if addr == address_string {
+                    return;
+                }
+                {
+                    let addr_port: Vec<&str> = address_string.split(':').collect();
+                    settings.address = addr_port.first().unwrap().to_string();
+                    settings.port = addr_port.last().unwrap().to_string().parse().unwrap();
+                }
+                let socket = UdpSocket::bind(addr_str).unwrap();
+                if let Some(endpoint) = self.endpoint.lock().unwrap().as_ref() {
+                    match endpoint.rebind(socket) {
+                        Err(x) => gst::warning!(CAT, imp: self, "error during rebind: {}", x),
+                        Ok(_) => gst::info!(CAT, imp: self,
+					     "succesful migration to {}",
+					     endpoint.local_addr().unwrap()),
+                    }
+                };
+            }
+            Err(e) => gst::element_imp_error!(
+                self,
+                gst::ResourceError::Failed,
+                ["Invalid client address: {}", e]
+            ),
         }
     }
 
@@ -755,6 +843,11 @@ impl QuinnQuicSrc {
                     ))
                 })?,
         };
+
+        {
+            let mut ep = self.endpoint.lock().unwrap();
+            *ep = Some(endpoint);
+        }
 
         let stream = if !use_datagram {
             let res = connection.accept_uni().await.map_err(|err| {

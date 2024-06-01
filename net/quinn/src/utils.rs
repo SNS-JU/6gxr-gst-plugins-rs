@@ -146,7 +146,7 @@ pub fn make_socket_addr(addr: &str) -> Result<SocketAddr, WaitError> {
         Ok(address) => Ok(address),
         Err(e) => Err(WaitError::FutureError(gst::error_msg!(
             gst::ResourceError::Failed,
-            ["Invalid address: {}", e]
+            ["Invalid address ({}): {}", addr, e]
         ))),
     }
 }
