@@ -489,6 +489,28 @@ impl ObjectImpl for QuinnQuicSrc {
             _ => unimplemented!(),
         }
     }
+
+    fn signals() -> &'static [glib::subclass::Signal] {
+        static SIGNALS: Lazy<Vec<glib::subclass::Signal>> = Lazy::new(|| {
+            vec![
+                glib::subclass::Signal::builder("rebind")
+                    .param_types([String::static_type()])
+                    .class_handler(|_token, args| {
+                        let element = args[0].get::<super::QuinnQuicSrc>().expect("signal arg");
+                        let addr_str = args[1].get::<String>().expect("signal arg");
+                        let imp = element.imp();
+                        gst::info!(CAT, "rebind signal with addr: {}", addr_str, );
+                        let mut settings = imp.settings.lock().unwrap();
+                        settings.migration_trigger_size = 1;
+                        settings.next_addr.clone_from(&addr_str);
+                        None
+                    })
+                    .build(),
+            ]
+        });
+
+        SIGNALS.as_ref()
+    }
 }
 
 #[glib::object_subclass]
