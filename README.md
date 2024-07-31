@@ -1,3 +1,15 @@
+# About this fork
+
+This fork of the
+[gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)
+project contains work created as part of the
+[REQUIEM](https://bit.ly/tki-6gxr-requiem)
+[open-call](https://www.6g-xr.eu/open-calls/oc1-results/) of the
+[6G-XR](https://www.6g-xr.eu/) EU project.
+
+We have upstreamed most of our contributions.  This repository
+contains commits that not necessarily make sense upstream.
+
 # gst-plugins-rs [![crates.io](https://img.shields.io/crates/v/gst-plugin.svg)](https://crates.io/crates/gst-plugin) [![pipeline status](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/badges/main/pipeline.svg)](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/commits/main)
 
 Repository containing various [GStreamer](https://gstreamer.freedesktop.org/)
